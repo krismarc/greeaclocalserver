@@ -30,6 +30,7 @@ internal class DeviceControllerService(
     /// and are dropped immediately when the device rejects the cached key.
     /// </summary>
     private readonly ConcurrentDictionary<string, CachedBind> _bindCache = new();
+    private readonly ConcurrentDictionary<string, bool> _gcmDevices = new();
 
     private static readonly TimeSpan BindCacheTtl = TimeSpan.FromMinutes(30);
 
@@ -270,7 +271,11 @@ internal class DeviceControllerService(
         return new BindResolution(scan, FromCache: false);
     }
 
-    private void InvalidateBind(string ipAddress) => _bindCache.TryRemove(ipAddress, out _);
+    private void InvalidateBind(string ipAddress)
+    {
+        _bindCache.TryRemove(ipAddress, out _);
+        _gcmDevices.TryRemove(ipAddress, out _);
+    }
 
     /// <summary>
     /// Sends a pack command using a (possibly cached) bind key. If the command
@@ -332,52 +337,85 @@ internal class DeviceControllerService(
     {
         try
         {
-            _logger.LogDebug("Scanning device at IP {IpAddress}", ipAddress);
-
-            var scanCommand = new ScanCommand();
-            var response = await SendUdpCommandAsync<ScanCommand, PackResponse>(ipAddress, scanCommand, cancellationToken);
-
+            var response = await SendUdpCommandAsync<ScanCommand, PackResponse>(ipAddress, new ScanCommand(), cancellationToken);
             if (response == null || string.IsNullOrEmpty(response.Data))
-            {
-                _logger.LogDebug("No response from device at IP {IpAddress}", ipAddress);
                 return new ScanResult(false, "Device did not respond to scan request", "NO_RESPONSE");
-            }
 
-
-            var decryptedPack = _cryptoService.Decrypt(response.Data, "");
-            var packResponse = JsonSerializer.Deserialize<ScanResponse>(decryptedPack);
-
-            if (packResponse == null || string.IsNullOrWhiteSpace(packResponse.Mac))
+            // Prefer the existing ECB path for legacy devices.
+            string? mac = null;
+            try
             {
-                _logger.LogWarning("MAC address not found in scan response from IP {IpAddress}", ipAddress);
-                return new ScanResult(false, "MAC address not found in scan response", "MAC_NOT_FOUND");
+                var scan = JsonSerializer.Deserialize<ScanResponse>(_cryptoService.Decrypt(response.Data));
+                mac = scan?.Mac;
             }
-
-            _logger.LogDebug("Device MAC discovered: {MacAddress}", packResponse.Mac);
-
-            var bindCommand = new BindCommand { UId = 0, Mac = packResponse.Mac };
-            var bindResponse = await SendPackCommandAsync<BindResponse, BindCommand>(ipAddress, packResponse.Mac, null, bindCommand, 1, cancellationToken);
-
-            if (bindResponse?.ResponseData == null || bindResponse.ResponseData.ResponseType != "bindok")
+            catch (Exception ex)
             {
-                _logger.LogDebug("Bind failed for MAC {MacAddress}", packResponse.Mac);
-                return new ScanResult(false, "Device did not respond to bind request", "BIND_NO_RESPONSE");
+                _logger.LogDebug(ex, "Legacy scan decode failed for {IpAddress}; attempting GCM", ipAddress);
             }
+            if (string.IsNullOrWhiteSpace(mac)) mac = response.Cid;
+            if (string.IsNullOrWhiteSpace(mac))
+                return new ScanResult(false, "No device MAC in scan response", "MAC_NOT_FOUND");
+            mac = GreeGcm.NormalizeMac(mac);
 
-            if (string.IsNullOrEmpty(bindResponse.ResponseData.CryptoKey))
+            try
             {
-                _logger.LogWarning("Crypto key not found in bind response for MAC {MacAddress}", packResponse.Mac);
-                return new ScanResult(false, "Crypto key not found in bind response", "KEY_NOT_FOUND");
+                var ecbBind = new BindCommand { UId = 0, Mac = mac };
+                var old = await SendPackCommandAsync<BindResponse, BindCommand>(ipAddress, mac, null, ecbBind, 1, cancellationToken);
+                if (old.IsSuccess && old.ResponseData?.ResponseType == "bindok"
+                    && !string.IsNullOrWhiteSpace(old.ResponseData.CryptoKey))
+                {
+                    _gcmDevices.TryRemove(ipAddress, out _);
+                    return new ScanResult(true, "Legacy device bound", null, mac, old.ResponseData.CryptoKey);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Legacy bind failed for {IpAddress}; trying GCM", ipAddress);
             }
 
-            _logger.LogDebug("Device scan completed successfully: MAC={MacAddress}", packResponse.Mac);
-            return new ScanResult(true, "Device scan successful", null, macAddress: packResponse.Mac, cryptoKey: bindResponse.ResponseData.CryptoKey);
+            var bindEnvelope = GreeGcm.CreateBindRequest(mac);
+            var bindReply = await SendRawUdpAsync(ipAddress, bindEnvelope, cancellationToken);
+            if (bindReply == null)
+                return new ScanResult(false, "No response to AES-GCM binding", "GCM_BIND_TIMEOUT");
+            var clear = GreeGcm.DecryptReply(GreeGcm.GenericKey, bindReply);
+            using var doc = JsonDocument.Parse(clear);
+            if (doc.RootElement.GetProperty("t").GetString() != "bindok")
+                return new ScanResult(false, "Unexpected AES-GCM bind response", "GCM_BIND_INVALID");
+            var key = doc.RootElement.GetProperty("key").GetString();
+            if (string.IsNullOrEmpty(key) || Encoding.UTF8.GetByteCount(key) != 16)
+                return new ScanResult(false, "Invalid AES-GCM device key", "GCM_KEY_INVALID");
+            _gcmDevices[ipAddress] = true;
+            _logger.LogInformation("AES-GCM v2 binding succeeded for IP {IpAddress}, MAC {MacAddress}", ipAddress, mac);
+            return new ScanResult(true, "AES-GCM device bound", null, mac, key);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Error scanning device at IP {IpAddress}", ipAddress);
+            _logger.LogWarning(ex, "Device scan/bind failed at {IpAddress}", ipAddress);
             return new ScanResult(false, $"Scan failed: {ex.Message}", "SCAN_EXCEPTION");
         }
+    }
+
+    private async Task<string?> SendRawUdpAsync(string ipAddress, string payload, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(CommandTimeoutMs);
+            try
+            {
+                using var udp = new UdpClient();
+                udp.Connect(IPAddress.Parse(ipAddress), CommandPort);
+                await udp.SendAsync(Encoding.UTF8.GetBytes(payload), cts.Token);
+                var response = await udp.ReceiveAsync(cts.Token);
+                return Encoding.UTF8.GetString(response.Buffer);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "UDP GCM request attempt {Attempt} failed for {IpAddress}", attempt + 1, ipAddress);
+            }
+        }
+        return null;
     }
 
     private async Task<PackCommandResult<TResponse>> SendPackCommandAsync<TResponse, TCommand>(string ipAddress, string macAddress, string? cryptoKey, TCommand command, int? id, CancellationToken cancellationToken)
@@ -385,7 +423,21 @@ internal class DeviceControllerService(
     {
         try
         {
-            var packData = JsonSerializer.Serialize(command);
+            var packData = command is QueryStatusCommand status
+                ? JsonSerializer.Serialize(new { cols = status.ParameterNames, mac = macAddress, t = "status" })
+                : JsonSerializer.Serialize(command);
+            if (_gcmDevices.ContainsKey(ipAddress))
+            {
+                if (string.IsNullOrEmpty(cryptoKey))
+                    return new PackCommandResult<TResponse>(false, "GCM device key required", "GCM_KEY_MISSING");
+                var request = GreeGcm.CreateRequest(macAddress, Encoding.UTF8.GetBytes(cryptoKey), packData);
+                var responseJson = await SendRawUdpAsync(ipAddress, request, cancellationToken);
+                if (responseJson == null)
+                    return new PackCommandResult<TResponse>(false, "No GCM reply", "NO_RESPONSE");
+                var plaintext = GreeGcm.DecryptReply(Encoding.UTF8.GetBytes(cryptoKey), responseJson);
+                var decoded = JsonSerializer.Deserialize<TResponse>(plaintext);
+                return new PackCommandResult<TResponse>(true, "AES-GCM command succeeded", null, decoded);
+            }
             var encryptedCommand = _cryptoService.Encrypt(packData, cryptoKey);
             var packCommand = new PackCommand(encryptedCommand, macAddress, id);
 
